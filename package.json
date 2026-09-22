@@ -1,0 +1,21 @@
+{
+  "name": "local-browser-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local persistent-profile browser MCP server for trusted local agents.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs --stdio",
+    "start:http": "node src/server.mjs --http",
+    "install-browser": "playwright install chromium",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "playwright": "1.63.0",
+    "zod": "3.25.76"
+  }
+}
