@@ -10,7 +10,7 @@ The browser uses a persistent local profile, so sign-ins and site state can surv
 - Screenshot, page state, readable page content, and clickable-element coordinates.
 - Semantic targeting by accessible role/name, label, placeholder, test ID, or CSS selector; coordinates are available when needed.
 - Mouse move and buttons, keyboard press/down/up, typing, wheel scrolling, and real drag-and-drop.
-- Ordered action sequences (up to 200 steps) with partial-progress and failed-step reporting.
+- Ordered, serialized action sequences (up to 200 steps) with repeated clicks/key presses and partial-progress reporting.
 - Tab creation, listing, switching, and closing; wait for selectors, text, or URL changes.
 - Persistent profile and optional cookie import. Cookie values are not returned in tool results or status output.
 - Windows terminal menu for server state, agent integrations, and optional startup-on-login.
@@ -64,7 +64,21 @@ The MCP server exposes these tools:
 | Tabs | `browser_tabs`, `browser_new_tab`, `browser_switch_tab`, `browser_close_tab` | List and manage open tabs. Browser actions operate on the active tab. |
 | Profile and cookies | `browser_import_cookies`, `browser_cookie_names`, `browser_save_profile`, `browser_close` | Import cookies, inspect cookie names without values, save the profile, or close the browser. |
 
-Prefer semantic locators (for example, a button's accessible role and name) when available: they are generally more robust than screen coordinates. Use `browser_observe` or `browser_clickable_elements` to inspect coordinates when a page has canvas/game controls or no useful accessible elements. `browser_actions` can chain up to 200 steps; if a step fails, the result reports completed steps and the failing action. `browser_release_inputs` is available to recover from a held mouse button or key.
+Prefer semantic locators (for example, a button's accessible role and name) when available: they are generally more robust than screen coordinates. Use `browser_observe` or `browser_clickable_elements` to inspect coordinates when a page has canvas/game controls or no useful accessible elements. Browser-changing MCP operations are serialized, so overlapping clicks, key presses, navigation, and tab changes cannot interleave with an action batch; read-only observations and waits remain independent. `browser_actions` can chain up to 200 steps; `press` sends a complete key press, while `key_down`/`key_up` support holds. `repeat` (up to 100) and `intervalMs` repeat clicks, presses, text, or scrolling; `afterMs` adds a short response window between steps (20 ms by default). For example:
+
+```json
+{
+  "actions": [
+    { "type": "click", "role": "button", "name": "Continue", "repeat": 3, "intervalMs": 80 },
+    { "type": "press", "key": "ArrowRight", "repeat": 4, "intervalMs": 50 },
+    { "type": "key_down", "key": "Space" },
+    { "type": "wait", "ms": 300 },
+    { "type": "key_up", "key": "Space" }
+  ]
+}
+```
+
+If a step fails, the result reports completed steps, the failed step/repetition, and any input cleanup errors. MCP-held keys/buttons are automatically released after a failed batch; `browser_release_inputs` is also available for explicit recovery.
 
 ## Profile and privacy
 

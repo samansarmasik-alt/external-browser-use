@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { createSerialQueue, runRepeatedAction } from "./serial-queue.mjs";
 
 const APP_NAME = "local-browser-mcp";
 const HTTP_HOST = "127.0.0.1";
@@ -399,7 +400,7 @@ async function clickableElements(page) {
   return { viewport, elements };
 }
 
-async function executeAction(page, action) {
+async function executeActionOnce(page, action) {
   switch (action.type) {
     case "click": {
       assertClickTarget(action);
@@ -439,6 +440,9 @@ async function executeAction(page, action) {
     case "key_up":
       await pressKeyUp(page, action.key);
       break;
+    case "press":
+      await page.keyboard.press(action.key, { delay: action.delayMs });
+      break;
     case "type":
       await page.keyboard.type(action.text, { delay: action.delayMs });
       break;
@@ -451,12 +455,49 @@ async function executeAction(page, action) {
     default:
       throw new Error(`Bilinmeyen action: ${action.type}`);
   }
+}
+
+async function executeAction(page, action) {
+  const repeat = action.repeat ?? 1;
+  if (repeat > 1 && !["click", "press", "type", "wheel"].includes(action.type)) {
+    throw new Error(`repeat is not supported for ${action.type}; use click, press, type, or wheel.`);
+  }
+  await runRepeatedAction(repeat, action.intervalMs ?? 0, () => executeActionOnce(page, action));
   if (action.afterMs) await new Promise((resolve) => setTimeout(resolve, action.afterMs));
+}
+
+const enqueueBrowserOperation = createSerialQueue();
+const serializedBrowserTools = new Set([
+  "browser_start",
+  "browser_mouse_move",
+  "browser_mouse_button",
+  "browser_keyboard",
+  "browser_drag",
+  "browser_actions",
+  "browser_new_tab",
+  "browser_switch_tab",
+  "browser_close_tab",
+  "browser_release_inputs",
+  "browser_open",
+  "browser_click",
+  "browser_type",
+  "browser_keypress",
+  "browser_mcp_pointer",
+  "browser_import_cookies",
+  "browser_save_profile",
+  "browser_close",
+]);
+
+function registerBrowserTool(server, name, options, handler) {
+  server.registerTool(name, options, (...args) => {
+    const operation = () => handler(...args);
+    return serializedBrowserTools.has(name) ? enqueueBrowserOperation(operation) : operation();
+  });
 }
 
 function registerTools(server) {
   const actionSchema = z.object({
-    type: z.enum(["click", "move", "down", "up", "key_down", "key_up", "type", "wheel", "wait"]),
+    type: z.enum(["click", "move", "down", "up", "key_down", "key_up", "press", "type", "wheel", "wait"]),
     selector: z.string().min(1).max(2_000).optional(),
     text: z.string().max(100_000).optional(),
     role: z.string().min(1).max(100).optional(),
@@ -475,10 +516,12 @@ function registerTools(server) {
     deltaY: z.number().min(-100_000).max(100_000).optional().default(0),
     ms: z.number().int().min(0).max(30_000).optional().default(0),
     delayMs: z.number().int().min(0).max(500).optional().default(0),
-    afterMs: z.number().int().min(0).max(2_000).optional().default(0),
+    repeat: z.number().int().min(1).max(100).optional().default(1),
+    intervalMs: z.number().int().min(0).max(2_000).optional().default(40),
+    afterMs: z.number().int().min(0).max(2_000).optional().default(20),
   });
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_start",
     {
       title: "Tarayıcıyı başlat",
@@ -500,7 +543,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_clickable_elements",
     {
       title: "Clickable elements and coordinates",
@@ -518,7 +561,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_observe",
     {
       title: "Observe browser",
@@ -542,7 +585,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_mouse_move",
     {
       title: "Move browser mouse",
@@ -565,7 +608,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_mouse_button",
     {
       title: "Browser mouse button",
@@ -599,7 +642,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_keyboard",
     {
       title: "Browser keyboard",
@@ -630,7 +673,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_drag",
     {
       title: "Drag and drop",
@@ -685,45 +728,67 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_actions",
     {
       title: "Run browser action sequence",
       description:
-        "Runs up to 200 ordered mouse, keyboard, wheel, typing and wait actions. Useful for games and multi-step interactions; each action is executed in order.",
+        "Runs an exclusive sequence of up to 200 mouse, key press/down/up, typing, wheel and wait actions. Use repeat (up to 100) and intervalMs for repeated clicks/keys/text; use afterMs between different steps when a game/page needs time to respond.",
       inputSchema: { actions: z.array(actionSchema).min(1).max(200) },
     },
     async ({ actions }) => {
       let page;
       let executed = 0;
+      let executedActions = 0;
       try {
         page = await requirePage();
         for (const [index, action] of actions.entries()) {
-          if (["key_down", "key_up"].includes(action.type) && !action.key) {
+          if (["key_down", "key_up", "press"].includes(action.type) && !action.key) {
             throw new Error(`Action ${index + 1}: key is required.`);
           }
           if (action.type === "type" && action.text === undefined) {
             throw new Error(`Action ${index + 1}: text is required.`);
           }
-          await executeAction(page, action);
+          try {
+            await executeAction(page, action);
+          } catch (error) {
+            if (error instanceof Error) error.actionIndex = index + 1;
+            executedActions += Math.max(0, (error?.repeatIndex ?? 1) - 1);
+            throw error;
+          }
           executed = index + 1;
+          executedActions += action.repeat ?? 1;
         }
-        return ok(JSON.stringify({ executed: actions.length, ...(await pageSummary(page)) }, null, 2));
+        return ok(JSON.stringify({ executed: actions.length, executedActions, ...(await pageSummary(page)) }, null, 2));
       } catch (error) {
         const inputState = page ? pageHeldInputs(page) : { keys: new Set(), buttons: new Set() };
+        let releasedInputs = { keys: [], buttons: [], errors: [] };
+        if (page && !page.isClosed()) {
+          releasedInputs = await releaseInputs(page);
+          try {
+            await setPointerPressed(page, false);
+          } catch {
+            // The page may have navigated or closed while recovering from the failed action.
+          }
+        }
         return fail(JSON.stringify({
           error: error instanceof Error ? error.message : "unknown error",
           executed,
-          failedAction: executed + 1,
-          heldKeys: [...inputState.keys],
-          heldButtons: [...inputState.buttons],
+          executedActions,
+          failedAction: error?.actionIndex ?? executed + 1,
+          failedRepeat: error?.repeatIndex,
+          releasedKeys: releasedInputs.keys,
+          releasedButtons: releasedInputs.buttons,
+          releaseErrors: releasedInputs.errors,
+          heldKeys: [...inputState.keys].filter((key) => !releasedInputs.keys.includes(key)),
+          heldButtons: [...inputState.buttons].filter((button) => !releasedInputs.buttons.includes(button)),
           ...(page ? await pageSummary(page) : {}),
         }, null, 2));
       }
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_status",
     {
       title: "Tarayıcı durumunu al",
@@ -732,7 +797,7 @@ function registerTools(server) {
     async () => ok(JSON.stringify(await pageSummary(), null, 2)),
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_tabs",
     {
       title: "List browser tabs",
@@ -754,7 +819,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_new_tab",
     {
       title: "Open browser tab",
@@ -775,7 +840,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_switch_tab",
     {
       title: "Switch browser tab",
@@ -796,7 +861,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_close_tab",
     {
       title: "Close browser tab",
@@ -819,7 +884,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_release_inputs",
     {
       title: "Release held browser inputs",
@@ -841,7 +906,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_open",
     {
       title: "Siteyi aç",
@@ -859,7 +924,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_page_content",
     {
       title: "Sayfa metnini al",
@@ -876,7 +941,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_screenshot",
     {
       title: "Ekran görüntüsü al",
@@ -902,7 +967,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_click",
     {
       title: "Tıkla",
@@ -949,7 +1014,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_type",
     {
       title: "Metin yaz",
@@ -983,7 +1048,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_keypress",
     {
       title: "Tuşa bas",
@@ -1005,7 +1070,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_wait",
     {
       title: "Wait for browser state",
@@ -1051,7 +1116,7 @@ function registerTools(server) {
     sameSite: z.enum(["Strict", "Lax", "None"]).optional(),
   });
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_import_cookies",
     {
       title: "Cookie içe aktar",
@@ -1091,7 +1156,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_cookie_names",
     {
       title: "Cookie listesini al",
@@ -1108,7 +1173,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_save_profile",
     {
       title: "Profili kaydet",
@@ -1121,7 +1186,7 @@ function registerTools(server) {
     },
   );
 
-  server.registerTool(
+  registerBrowserTool(server,
     "browser_close",
     {
       title: "Tarayıcıyı kapat",
