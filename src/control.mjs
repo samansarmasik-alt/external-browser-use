@@ -329,11 +329,16 @@ function runPowerShell(script, environment = {}) {
 }
 
 function startupCommand() {
-  const nodew = process.execPath.toLowerCase().endsWith("node.exe")
-    ? process.execPath.slice(0, -8) + "nodew.exe"
-    : process.execPath;
-  const executable = existsSync(nodew) ? nodew : process.execPath;
-  return `"${executable}" "${SERVER_FILE}" --http`;
+  const quotePowerShell = (value) => `'${value.replaceAll("'", "''")}'`;
+  const command = [
+    "Start-Process",
+    "-FilePath", quotePowerShell(process.execPath),
+    "-ArgumentList", quotePowerShell(`"${SERVER_FILE}" --http`),
+    "-WorkingDirectory", quotePowerShell(ROOT),
+    "-WindowStyle Hidden",
+  ].join(" ");
+  const encodedCommand = Buffer.from(command, "utf16le").toString("base64");
+  return `powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${encodedCommand}`;
 }
 
 function startupValue() {
