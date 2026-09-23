@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import os from "node:os";
 import path from "node:path";
 
+import puppeteer from "puppeteer-core";
 import { chromium } from "playwright";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -13,6 +14,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { createSerialQueue, runRepeatedAction } from "./serial-queue.mjs";
+import { connectRemoteBrowser, discoverRemoteBrowsers } from "./remote-browsers.mjs";
 
 const APP_NAME = "local-browser-mcp";
 const HTTP_HOST = "127.0.0.1";
@@ -29,6 +31,10 @@ const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 let context = null;
 let activePage = null;
 let browserStartPromise = null;
+let remoteBrowser = null;
+let remoteBrowserInfo = null;
+let remoteActivePage = null;
+const remoteHeldInputs = new WeakMap();
 const heldInputs = new WeakMap();
 const watchedPages = new WeakSet();
 
@@ -203,6 +209,59 @@ async function pageSummary(page = activePage) {
     // The page can close while a client is reading its status.
   }
   return { active: true, url: page.url(), title };
+}
+
+async function requireRemotePage() {
+  if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil; önce browser_external_discover/connect kullanın.");
+  if (!remoteActivePage || remoteActivePage.isClosed()) {
+    const pages = await remoteBrowser.pages();
+    remoteActivePage = pages[0] || (await remoteBrowser.newPage());
+  }
+  return remoteActivePage;
+}
+
+async function remotePageSummary(page = remoteActivePage) {
+  if (!page || page.isClosed()) return { active: false };
+  let title = "";
+  try {
+    title = await page.title();
+  } catch {
+    // The page can close while a client is reading its status.
+  }
+  return { active: true, url: page.url(), title };
+}
+
+function remoteInputState(page) {
+  let state = remoteHeldInputs.get(page);
+  if (!state) {
+    state = { keys: new Set(), buttons: new Set() };
+    remoteHeldInputs.set(page, state);
+  }
+  return state;
+}
+
+async function releaseRemoteInputs(page) {
+  const state = remoteInputState(page);
+  const released = { keys: [], buttons: [], errors: [] };
+  for (const key of [...state.keys]) {
+    try {
+      await page.keyboard.up(key);
+      state.keys.delete(key);
+      released.keys.push(key);
+    } catch (error) {
+      released.errors.push(`key ${key}: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+  for (const button of [...state.buttons]) {
+    try {
+      await page.mouse.up({ button });
+      state.buttons.delete(button);
+      released.buttons.push(button);
+    } catch (error) {
+      released.errors.push(`mouse ${button}: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+  return released;
 }
 
 function getTarget(page, input, prefix = "") {
@@ -486,6 +545,16 @@ const serializedBrowserTools = new Set([
   "browser_import_cookies",
   "browser_save_profile",
   "browser_close",
+  "browser_external_connect",
+  "browser_external_disconnect",
+  "browser_external_switch_tab",
+  "browser_external_new_tab",
+  "browser_external_close_tab",
+  "browser_external_navigate",
+  "browser_external_click",
+  "browser_external_sequence",
+  "browser_external_move",
+  "browser_external_key",
 ]);
 
 function registerBrowserTool(server, name, options, handler) {
@@ -1201,6 +1270,285 @@ function registerTools(server) {
   );
 }
 
+function registerExternalBrowserTools(server) {
+  const externalActionSchema = z.object({
+    type: z.enum(["click", "move", "down", "up", "key_down", "key_up", "press", "type", "wheel", "wait"]),
+    selector: z.string().min(1).max(2_000).optional(),
+    x: z.number().min(0).max(20_000).optional(),
+    y: z.number().min(0).max(20_000).optional(),
+    button: z.enum(["left", "right", "middle"]).optional().default("left"),
+    clickCount: z.number().int().min(1).max(3).optional().default(1),
+    steps: z.number().int().min(1).max(200).optional().default(8),
+    key: z.string().min(1).max(100).optional(),
+    text: z.string().max(100_000).optional(),
+    deltaX: z.number().min(-100_000).max(100_000).optional().default(0),
+    deltaY: z.number().min(-100_000).max(100_000).optional().default(0),
+    ms: z.number().int().min(0).max(30_000).optional().default(0),
+    repeat: z.number().int().min(1).max(100).optional().default(1),
+    intervalMs: z.number().int().min(0).max(2_000).optional().default(40),
+  });
+
+  registerBrowserTool(server, "browser_external_discover", {
+    title: "Discover running browsers",
+    description: "Yerel olarak çalışan ve --remote-debugging-port ile açıkça erişime açılmış Chrome/Edge/Thorium/Chromium/Brave/Vivaldi/Opera/Firefox tarayıcılarını bulur. Debug kapalı tarayıcıları göstermez.",
+    inputSchema: {},
+  }, async () => {
+    try { return ok(JSON.stringify(await discoverRemoteBrowsers(), null, 2)); }
+    catch (error) { return fail(`Browser discovery failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_connect", {
+    title: "Attach to an open browser",
+    description: "Yerel debug portu üzerinden mevcut Chromium/CDP veya Firefox/BiDi oturumuna bağlanır. Browser veya profili kapatmaz. Önce browser_external_discover kullanın.",
+    inputSchema: { protocol: z.enum(["cdp", "webDriverBiDi"]), port: z.number().int().min(1).max(65_535) },
+  }, async ({ protocol, port }) => {
+    let connection;
+    try {
+      const target = await connectRemoteBrowser({ protocol, port });
+      connection = await puppeteer.connect({ browserWSEndpoint: target.endpoint, protocol: target.protocol, defaultViewport: null });
+      const pages = await connection.pages();
+      if (!pages.length) throw new Error("Tarayıcı bağlandı ancak açık sekme bulunamadı.");
+      if (remoteBrowser) await remoteBrowser.disconnect();
+      remoteBrowser = connection;
+      remoteBrowserInfo = { protocol, port, browser: protocol === "webDriverBiDi" ? "Firefox" : "Chromium tabanlı" };
+      const discovered = await discoverRemoteBrowsers();
+      const detectedBrowser = discovered.find((item) => item.port === port && item.protocol === protocol)?.browser;
+      if (detectedBrowser) remoteBrowserInfo.browser = detectedBrowser;
+      remoteActivePage = pages[0];
+      for (const page of pages) page.on("close", () => {
+        if (remoteActivePage === page) remoteActivePage = null;
+      });
+      return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: pages.length, ...(await remotePageSummary(remoteActivePage)) }, null, 2));
+    } catch (error) {
+      if (connection && connection !== remoteBrowser) await connection.disconnect().catch(() => {});
+      return fail(`External browser attach failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  });
+
+  registerBrowserTool(server, "browser_external_status", {
+    title: "External browser status",
+    description: "Bağlı harici tarayıcıyı ve etkin sekmeyi gösterir; cookie veya profil dosyalarını okumaz.",
+    inputSchema: {},
+  }, async () => {
+    if (!remoteBrowser) return ok(JSON.stringify({ connected: false }));
+    try { return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: (await remoteBrowser.pages()).length, ...(await remotePageSummary()) }, null, 2)); }
+    catch (error) { return fail(`External browser status failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_tabs", {
+    title: "List external browser tabs",
+    description: "Harici tarayıcı sekmelerini indeks, başlık ve URL ile listeler; cookie değerleri döndürmez.",
+    inputSchema: {},
+  }, async () => {
+    try {
+      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const pages = await remoteBrowser.pages();
+      return ok(JSON.stringify(await Promise.all(pages.map(async (page, index) => ({ index, active: page === remoteActivePage, ...(await remotePageSummary(page)) }))), null, 2));
+    } catch (error) { return fail(`External tabs failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_switch_tab", {
+    title: "Switch external browser tab",
+    description: "Harici tarayıcıda sıfır tabanlı indeks ile sekmeyi seçip öne getirir.",
+    inputSchema: { index: z.number().int().min(0).max(200) },
+  }, async ({ index }) => {
+    try {
+      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const page = (await remoteBrowser.pages())[index];
+      if (!page || page.isClosed()) throw new Error(`Sekme indeksi ${index} bulunamadı.`);
+      remoteActivePage = page;
+      await page.bringToFront();
+      return ok(JSON.stringify({ index, ...(await remotePageSummary(page)) }, null, 2));
+    } catch (error) { return fail(`External tab switch failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_new_tab", {
+    title: "Open external browser tab",
+    description: "Bağlı tarayıcıda yeni görünür sekme açıp etkinleştirir.",
+    inputSchema: { url: z.string().max(2_048).optional() },
+  }, async ({ url }) => {
+    try {
+      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const page = await remoteBrowser.newPage();
+      remoteActivePage = page;
+      if (url) await page.goto(validateHttpUrl(url));
+      await page.bringToFront();
+      return ok(JSON.stringify(await remotePageSummary(page), null, 2));
+    } catch (error) { return fail(`External new tab failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_close_tab", {
+    title: "Close external browser tab",
+    description: "Yalnızca indeksli harici sekmeyi kapatır; browser/profile kapanmaz.",
+    inputSchema: { index: z.number().int().min(0).max(200) },
+  }, async ({ index }) => {
+    try {
+      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const pages = await remoteBrowser.pages();
+      const page = pages[index];
+      if (!page || page.isClosed()) throw new Error(`Sekme indeksi ${index} bulunamadı.`);
+      await page.close();
+      const remaining = await remoteBrowser.pages();
+      remoteActivePage = remaining.at(-1) || null;
+      if (remoteActivePage) await remoteActivePage.bringToFront();
+      return ok(JSON.stringify({ closedIndex: index, tabsRemaining: remaining.length, ...(await remotePageSummary()) }, null, 2));
+    } catch (error) { return fail(`External tab close failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_observe", {
+    title: "Observe external browser tab",
+    description: "Etkin harici sekmenin ekran görüntüsünü ve görünür metin özetini alır.",
+    inputSchema: { fullPage: z.boolean().optional().default(false) },
+  }, async ({ fullPage }) => {
+    try {
+      const page = await requireRemotePage();
+      const screenshot = await page.screenshot({ type: "png", fullPage });
+      if (screenshot.byteLength > MAX_SCREENSHOT_BYTES) throw new Error("Screenshot 8 MB sınırını aşıyor; fullPage=false deneyin.");
+      const summary = await remotePageSummary(page);
+      const text = await page.evaluate(() => (document.body?.innerText || "").slice(0, 12_000));
+      return { content: [{ type: "text", text: JSON.stringify({ ...summary, text }, null, 2) }, { type: "image", data: Buffer.from(screenshot).toString("base64"), mimeType: "image/png" }] };
+    } catch (error) { return fail(`External observe failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_clickable_elements", {
+    title: "Find external tab click targets",
+    description: "Harici sekmedeki görünür tıklanabilir/form/canvas öğelerini CSS selector ve viewport koordinatlarıyla listeler.",
+    inputSchema: {},
+  }, async () => {
+    try {
+      const page = await requireRemotePage();
+      const elements = await visibleElementData({ evaluate: (fn) => page.evaluate(fn) });
+      return ok(JSON.stringify({ ...(await remotePageSummary(page)), elements }, null, 2));
+    } catch (error) { return fail(`External element scan failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_navigate", {
+    title: "Navigate external browser tab",
+    description: "Etkin harici sekmeyi HTTP(S) URL'ine götürür.",
+    inputSchema: { url: z.string().min(1).max(2_048) },
+  }, async ({ url }) => {
+    try {
+      const page = await requireRemotePage();
+      await page.goto(validateHttpUrl(url));
+      return ok(JSON.stringify(await remotePageSummary(page), null, 2));
+    } catch (error) { return fail(`External navigation failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_click", {
+    title: "Click external browser",
+    description: "Etkin harici sekmede CSS selector veya viewport x/y koordinatıyla tıklar.",
+    inputSchema: {
+      selector: z.string().min(1).max(2_000).optional(),
+      x: z.number().min(0).max(20_000).optional(),
+      y: z.number().min(0).max(20_000).optional(),
+      button: z.enum(["left", "right", "middle"]).optional().default("left"),
+      clickCount: z.number().int().min(1).max(3).optional().default(1),
+    },
+  }, async ({ selector, x, y, button, clickCount }) => {
+    try {
+      if (Boolean(selector) === (x !== undefined || y !== undefined)) throw new Error("Ya selector ya da hem x hem y verin.");
+      if ((x === undefined) !== (y === undefined)) throw new Error("x ve y birlikte verilmelidir.");
+      const page = await requireRemotePage();
+      if (selector) await page.click(selector, { button, clickCount });
+      else await page.mouse.click(x, y, { button, clickCount });
+      return ok(JSON.stringify(await remotePageSummary(page), null, 2));
+    } catch (error) { return fail(`External click failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_move", {
+    title: "Move external browser mouse",
+    description: "Etkin harici sekmede görünür mouse pointer'ını viewport koordinatına taşır.",
+    inputSchema: { x: z.number().min(0).max(20_000), y: z.number().min(0).max(20_000), steps: z.number().int().min(1).max(200).optional().default(8) },
+  }, async ({ x, y, steps }) => {
+    try {
+      const page = await requireRemotePage();
+      await page.mouse.move(x, y, { steps });
+      return ok(JSON.stringify({ x, y, ...(await remotePageSummary(page)) }, null, 2));
+    } catch (error) { return fail(`External mouse move failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_key", {
+    title: "Send external browser keyboard input",
+    description: "Etkin harici sekmeye tuş basar/basılı tutar/bırakır veya metin yazar.",
+    inputSchema: {
+      action: z.enum(["press", "down", "up", "type"]),
+      key: z.string().min(1).max(100).optional(),
+      text: z.string().max(100_000).optional(),
+      delayMs: z.number().int().min(0).max(500).optional().default(0),
+    },
+  }, async ({ action, key, text, delayMs }) => {
+    try {
+      if (action === "type" ? text === undefined : key === undefined) throw new Error("type için text; diğer işlemler için key gerekli.");
+      const page = await requireRemotePage();
+      const state = remoteInputState(page);
+      if (action === "press") await page.keyboard.press(key);
+      if (action === "down") { await page.keyboard.down(key); state.keys.add(key); }
+      if (action === "up") { await page.keyboard.up(key); state.keys.delete(key); }
+      if (action === "type") await page.keyboard.type(text, delayMs ? { delay: delayMs } : undefined);
+      return ok(JSON.stringify({ action, ...(await remotePageSummary(page)) }, null, 2));
+    } catch (error) { return fail(`External keyboard failed: ${error instanceof Error ? error.message : "unknown error"}`); }
+  });
+
+  registerBrowserTool(server, "browser_external_sequence", {
+    title: "Run external browser action sequence",
+    description: "Harici sekmede ardışık click/mouse/keyboard/wheel/type/wait aksiyonları çalıştırır; hata halinde MCP'nin basılı tuttuğu girdileri bırakır.",
+    inputSchema: { actions: z.array(externalActionSchema).min(1).max(200) },
+  }, async ({ actions }) => {
+    let page;
+    try { page = await requireRemotePage(); }
+    catch (error) { return fail(error instanceof Error ? error.message : "Harici tarayıcı bağlı değil."); }
+    let executed = 0;
+    const state = remoteInputState(page);
+    try {
+      for (const [index, action] of actions.entries()) {
+        if (action.repeat > 1 && !["click", "press", "type", "wheel"].includes(action.type)) throw new Error(`repeat ${action.type} için desteklenmiyor.`);
+        if (action.type === "click" && !action.selector && (action.x === undefined || action.y === undefined)) throw new Error(`click için selector veya x/y gerekli (adım ${index + 1}).`);
+        if (action.type === "click" && action.selector && (action.x !== undefined || action.y !== undefined)) throw new Error(`click selector ve koordinat birlikte verilemez (adım ${index + 1}).`);
+        if (action.type === "move" && (action.x === undefined || action.y === undefined)) throw new Error(`move için x/y gerekli (adım ${index + 1}).`);
+        if (["press", "key_down", "key_up"].includes(action.type) && !action.key) throw new Error(`key gerekli (adım ${index + 1}).`);
+        if (action.type === "type" && action.text === undefined) throw new Error(`text gerekli (adım ${index + 1}).`);
+        if (action.type === "down" && (action.x === undefined) !== (action.y === undefined)) throw new Error(`down requires both x and y coordinates at step ${index + 1}.`);
+        const runOnce = async () => {
+          if (action.type === "click") {
+            if (action.selector) await page.click(action.selector, { button: action.button, clickCount: action.clickCount });
+            else await page.mouse.click(action.x, action.y, { button: action.button, clickCount: action.clickCount });
+          } else if (action.type === "move") await page.mouse.move(action.x, action.y, { steps: action.steps });
+          else if (action.type === "down") { if (action.x !== undefined) await page.mouse.move(action.x, action.y, { steps: action.steps }); await page.mouse.down({ button: action.button }); state.buttons.add(action.button); }
+          else if (action.type === "up") { await page.mouse.up({ button: action.button }); state.buttons.delete(action.button); }
+          else if (action.type === "key_down") { await page.keyboard.down(action.key); state.keys.add(action.key); }
+          else if (action.type === "key_up") { await page.keyboard.up(action.key); state.keys.delete(action.key); }
+          else if (action.type === "press") await page.keyboard.press(action.key);
+          else if (action.type === "type") await page.keyboard.type(action.text);
+          else if (action.type === "wheel") await page.mouse.wheel(action.deltaX, action.deltaY);
+          else if (action.type === "wait" && action.ms) await new Promise((resolve) => setTimeout(resolve, action.ms));
+        };
+        await runRepeatedAction(action.repeat, action.intervalMs, async () => {
+          await runOnce();
+          executed += 1;
+        });
+      }
+      return ok(JSON.stringify({ executed, ...(await remotePageSummary(page)) }, null, 2));
+    } catch (error) {
+      const released = await releaseRemoteInputs(page);
+      return fail(JSON.stringify({ error: error instanceof Error ? error.message : "unknown error", executed, released, ...(await remotePageSummary(page)) }, null, 2));
+    }
+  });
+
+  registerBrowserTool(server, "browser_external_disconnect", {
+    title: "Detach from external browser",
+    description: "MCP bağlantısını ayırır; gerçek tarayıcıyı, sekmeleri ve profili kapatmaz.",
+    inputSchema: {},
+  }, async () => {
+    if (!remoteBrowser) return ok("Harici tarayıcı bağlı değil.");
+    const detached = remoteBrowser;
+    remoteBrowser = null;
+    remoteBrowserInfo = null;
+    remoteActivePage = null;
+    await detached.disconnect();
+    return ok("Harici tarayıcıdan ayrıldı; tarayıcı ve sekmeler açık kaldı.");
+  });
+}
+
 function createMcpServer() {
   const server = new McpServer(
     {
@@ -1209,10 +1557,11 @@ function createMcpServer() {
     },
     {
       instructions:
-        "Bu sunucu yalnızca kullanıcının yerel, kalıcı tarayıcı profiline erişir. Hassas cookie değerlerini istemeyin veya cevaba yazmayın. Önce browser_status/browser_start, sonra page_content veya screenshot kullanın; tıklama ve form gönderme gibi yan etkili işlemleri kullanıcı amacıyla sınırlayın.",
+        "Bu sunucu kendi yerel profilini ve kullanıcının açıkça --remote-debugging-port ile erişime açtığı mevcut yerel tarayıcıları kontrol edebilir. Harici tarayıcı için browser_external_discover ve browser_external_connect kullanın; sekmeleri browser_external_tabs/browser_external_switch_tab ile yönetin, browser_external_disconnect ile yalnızca bağlantıyı ayırın. MCP kapanışı harici tarayıcıyı kapatmaz. Debug endpoint'leri yalnızca loopback üzerinden kabul edilir. Cookie değerlerini istemeyin veya döndürmeyin; yan etkili işlemleri kullanıcı amacıyla sınırlayın.",
     },
   );
   registerTools(server);
+  registerExternalBrowserTools(server);
   return server;
 }
 
@@ -1384,6 +1733,11 @@ async function startHttp() {
 }
 
 async function closeBrowser() {
+  const external = remoteBrowser;
+  remoteBrowser = null;
+  remoteBrowserInfo = null;
+  remoteActivePage = null;
+  if (external) await external.disconnect().catch(() => {});
   if (!context) return;
   const closing = context;
   context = null;

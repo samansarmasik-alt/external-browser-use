@@ -15,6 +15,14 @@ The browser uses a persistent local profile, so sign-ins and site state can surv
 - Persistent profile and optional cookie import. Cookie values are not returned in tool results or status output.
 - Windows terminal menu for server state, agent integrations, and optional startup-on-login.
 
+## Attach to an already-open browser
+
+The MCP can attach to a browser session that was started with its local debugging interface enabled. It discovers supported local browser processes and provides tab listing/switching, screenshots, clickable coordinates, navigation, mouse/keyboard input, and serialized action sequences under the `browser_external_*` tools. Chromium-based browsers use CDP; Firefox-family browsers use WebDriver BiDi where supported by that browser build.
+
+This cannot be enabled retroactively: close and relaunch the browser with a non-zero `--remote-debugging-port` (for example, `--remote-debugging-port=9222` for Chromium or `--remote-debugging-port=9223` for Firefox), then call `browser_external_discover` and `browser_external_connect`. Browser support depends on its version/build exposing the expected local protocol endpoint. The server accepts only loopback endpoints; do not expose debugging ports to a network. A debugging endpoint grants broad access to the signed-in session, so only connect trusted agents to browsers/profiles you intend them to control.
+
+`browser_external_disconnect` and MCP shutdown detach the automation connection without closing the real browser, tabs, or profile. The agent's pointer and keyboard events target the browser page; this does not take over the operating-system desktop or move its physical cursor.
+
 ## Requirements
 
 - Windows for the included management menu, startup integration, and one-key agent setup.
