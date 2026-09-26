@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import os from "node:os";
@@ -21,6 +21,9 @@ const CODEX_CONFIG_PATH = path.join(HOME_DIR, ".codex", "config.toml");
 const OPENCODE_CONFIG_PATH = path.join(HOME_DIR, ".config", "opencode", "opencode.json");
 const OPENCODE_JSONC_PATH = path.join(HOME_DIR, ".config", "opencode", "opencode.jsonc");
 const COMMAND_CODE_CONFIG_PATH = path.join(HOME_DIR, ".commandcode", "mcp.json");
+const GEMINI_CLI_CONFIG_PATH = path.join(HOME_DIR, ".gemini", "settings.json");
+const ANTIGRAVITY_CONFIG_PATH = path.join(HOME_DIR, ".gemini", "config", "mcp_config.json");
+const ANTIGRAVITY_EXE_PATH = path.join(LOCAL_APP_DATA, "Programs", "Antigravity", "Antigravity.exe");
 const COMMAND_CODE_CLI_PATH = path.join(
   process.env.APPDATA || path.join(HOME_DIR, "AppData", "Roaming"),
   "npm",
@@ -111,6 +114,61 @@ function commandCodeConfigured() {
   return Boolean(entry && JSON.stringify(entry).includes(MCP_URL));
 }
 
+function configEntry(filePath, description) {
+  const text = readTextSafe(filePath);
+  if (!text) return {};
+  const config = readJsonSafe(filePath);
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`${description} ayar dosyasi JSON olarak okunamadi; dosya degistirilmedi.`);
+  }
+  return config;
+}
+
+function writeMcpConfig(filePath, description, configure) {
+  const config = configEntry(filePath, description);
+  const servers = config.mcpServers && typeof config.mcpServers === "object" && !Array.isArray(config.mcpServers)
+    ? config.mcpServers
+    : {};
+  const key = "local-browser";
+  const existing = servers[key] && typeof servers[key] === "object" && !Array.isArray(servers[key])
+    ? servers[key]
+    : {};
+  servers[key] = configure(existing);
+  config.mcpServers = servers;
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function geminiCliConfigured() {
+  const entry = readJsonSafe(GEMINI_CLI_CONFIG_PATH)?.mcpServers?.["local-browser"];
+  return Boolean(entry && JSON.stringify(entry).includes(MCP_URL));
+}
+
+function installGeminiCli() {
+  const token = readToken();
+  if (!token) throw new Error("MCP token bulunamadi; once MCP sunucusunu baslatin.");
+  writeMcpConfig(GEMINI_CLI_CONFIG_PATH, "Gemini CLI", (entry) => ({
+    ...entry,
+    httpUrl: MCP_URL,
+    headers: { ...entry.headers, Authorization: `Bearer ${token}` },
+  }));
+}
+
+function antigravityConfigured() {
+  const entry = readJsonSafe(ANTIGRAVITY_CONFIG_PATH)?.mcpServers?.["local-browser"];
+  return Boolean(entry && JSON.stringify(entry).includes(MCP_URL));
+}
+
+function installAntigravity() {
+  const token = readToken();
+  if (!token) throw new Error("MCP token bulunamadi; once MCP sunucusunu baslatin.");
+  writeMcpConfig(ANTIGRAVITY_CONFIG_PATH, "Antigravity", (entry) => ({
+    ...entry,
+    serverUrl: MCP_URL,
+    headers: { ...entry.headers, Authorization: `Bearer ${token}` },
+  }));
+}
+
 function runClientCommand(executable, args) {
   const result = spawnSync(executable, args, {
     cwd: ROOT,
@@ -173,6 +231,22 @@ const AGENTS = [
         "local-browser", MCP_URL,
       ]);
     },
+  },
+  {
+    key: "gemini-cli",
+    name: "Gemini CLI",
+    installed: () => commandAvailable("gemini"),
+    configured: geminiCliConfigured,
+    install: installGeminiCli,
+  },
+  {
+    key: "antigravity",
+    name: "Antigravity",
+    installed: () => commandAvailable("agy")
+      || existsSync(ANTIGRAVITY_EXE_PATH)
+      || existsSync(path.dirname(ANTIGRAVITY_CONFIG_PATH)),
+    configured: antigravityConfigured,
+    install: installAntigravity,
   },
 ];
 

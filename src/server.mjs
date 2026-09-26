@@ -1,5 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer } from "node:http";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -27,22 +29,80 @@ const PID_PATH = path.join(APP_DATA_DIR, "server.pid");
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_TEXT_BYTES = 60_000;
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_MCP_CLIENTS = 24;
+const MAX_TABS_PER_CLIENT = 4;
+const IDLE_TAB_TIMEOUT_MS = Number.parseInt(process.env.BROWSER_MCP_IDLE_TAB_MS || "900000", 10);
+const DEFAULT_VIEWPORT = { width: 1920, height: 1080 };
 
 let context = null;
-let activePage = null;
 let browserStartPromise = null;
-let remoteBrowser = null;
-let remoteBrowserInfo = null;
-let remoteActivePage = null;
+const clientStorage = new AsyncLocalStorage();
+const fallbackClientState = createClientState("stdio");
+const clientStates = new Map([["stdio", fallbackClientState]]);
+const pageOwners = new WeakMap();
+const serverClientStates = new WeakMap();
 const remoteHeldInputs = new WeakMap();
 const heldInputs = new WeakMap();
 const watchedPages = new WeakSet();
+const mousePositions = new WeakMap();
 
-function watchPage(page) {
+function createClientState(id) {
+  return {
+    id,
+    activePage: null,
+    pages: new Set(),
+    remoteBrowser: null,
+    remoteBrowserInfo: null,
+    remoteActivePage: null,
+    humanizer: {
+      enabled: false,
+      movementMinMs: 180,
+      movementMaxMs: 420,
+      thinkingDelayMinMs: 0,
+      thinkingDelayMaxMs: 0,
+    },
+    queue: createSerialQueue(),
+    idleTimer: null,
+  };
+}
+
+function currentClientState() {
+  return clientStorage.getStore() || fallbackClientState;
+}
+
+function availableClientSlot() {
+  const occupied = new Set([...clientStates.values()].map((state) => state.slot).filter(Number.isInteger));
+  for (let slot = 1; slot <= MAX_MCP_CLIENTS; slot += 1) {
+    if (!occupied.has(slot)) return slot;
+  }
+  return null;
+}
+
+function scheduleClientIdleCleanup(state) {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  state.idleTimer = null;
+  if (!Number.isFinite(IDLE_TAB_TIMEOUT_MS) || IDLE_TAB_TIMEOUT_MS <= 0) return;
+  if (![...state.pages].some((page) => !page.isClosed())) return;
+  state.idleTimer = setTimeout(async () => {
+    state.idleTimer = null;
+    for (const page of [...state.pages]) {
+      if (page.isClosed()) continue;
+      await releaseInputs(page).catch(() => {});
+      await page.close().catch(() => {});
+    }
+    state.activePage = null;
+  }, IDLE_TAB_TIMEOUT_MS);
+  state.idleTimer.unref?.();
+}
+
+function watchPage(page, owner = currentClientState()) {
+  pageOwners.set(page, owner);
+  owner.pages.add(page);
   if (watchedPages.has(page)) return page;
   watchedPages.add(page);
   page.on("close", () => {
-    if (activePage === page) activePage = context?.pages().at(-1) || null;
+    owner.pages.delete(page);
+    if (owner.activePage === page) owner.activePage = [...owner.pages].filter((item) => !item.isClosed()).at(-1) || null;
   });
   return page;
 }
@@ -151,9 +211,37 @@ function cookieDescription(cookie) {
 }
 
 function activeHttpUrl() {
+  const activePage = currentClientState().activePage;
   if (!activePage || activePage.isClosed()) return undefined;
   const value = activePage.url();
   return value.startsWith("http://") || value.startsWith("https://") ? value : undefined;
+}
+
+function resolveBrowserViewport() {
+  const widthOverride = Number.parseInt(process.env.BROWSER_MCP_VIEWPORT_WIDTH || "", 10);
+  const heightOverride = Number.parseInt(process.env.BROWSER_MCP_VIEWPORT_HEIGHT || "", 10);
+  if (Number.isFinite(widthOverride) && widthOverride >= 640 && Number.isFinite(heightOverride) && heightOverride >= 480) {
+    return { width: widthOverride, height: heightOverride };
+  }
+
+  if (process.platform === "win32") {
+    try {
+      const output = execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Add-Type -AssemblyName System.Windows.Forms; $r = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; Write-Output ($r.Width.ToString() + ',' + $r.Height.ToString())",
+      ], { encoding: "utf8", timeout: 5_000, windowsHide: true }).trim();
+      const [width, height] = output.split(",").map((value) => Number.parseInt(value, 10));
+      if (Number.isFinite(width) && width >= 640 && Number.isFinite(height) && height >= 480) {
+        // Reserve space for the headed browser's title bar, tabs, and toolbar.
+        return { width: Math.max(640, width - 16), height: Math.max(480, height - 100) };
+      }
+    } catch {
+      // Keep MCP startup working when PowerShell/WinForms is unavailable.
+    }
+  }
+  return DEFAULT_VIEWPORT;
 }
 
 async function ensureBrowser(headless = false) {
@@ -162,24 +250,40 @@ async function ensureBrowser(headless = false) {
 
   browserStartPromise = (async () => {
     await mkdir(PROFILE_DIR, { recursive: true });
+    const viewport = resolveBrowserViewport();
     const nextContext = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless,
-      viewport: { width: 1280, height: 800 },
+      viewport,
+      deviceScaleFactor: 1,
+      args: headless ? [] : ["--start-maximized"],
       acceptDownloads: false,
       ignoreHTTPSErrors: false,
     });
     nextContext.setDefaultTimeout(15_000);
     nextContext.setDefaultNavigationTimeout(30_000);
     context = nextContext;
-    activePage = nextContext.pages()[0] || (await nextContext.newPage());
-    for (const page of nextContext.pages()) watchPage(page);
+    const initialPage = nextContext.pages()[0] || (await nextContext.newPage());
+    const owner = currentClientState();
+    owner.activePage = initialPage;
+    for (const page of nextContext.pages()) watchPage(page, owner);
     nextContext.on("page", (page) => {
-      watchPage(page);
-      activePage = page;
+      void page.opener().then((opener) => {
+        if (!opener) return;
+        const pageOwner = pageOwners.get(opener) || owner;
+        if ([...pageOwner.pages].filter((item) => !item.isClosed()).length >= MAX_TABS_PER_CLIENT) {
+          void page.close().catch(() => {});
+          return;
+        }
+        watchPage(page, pageOwner);
+        pageOwner.activePage = page;
+      }).catch(() => {});
     });
     nextContext.on("close", () => {
       context = null;
-      activePage = null;
+      for (const state of clientStates.values()) {
+        state.activePage = null;
+        state.pages.clear();
+      }
     });
     return nextContext;
   })();
@@ -192,15 +296,19 @@ async function ensureBrowser(headless = false) {
 }
 
 async function requirePage(headless = false) {
+  const state = currentClientState();
   const browserContext = await ensureBrowser(headless);
-  if (!activePage || activePage.isClosed()) {
-    activePage = browserContext.pages()[0] || (await browserContext.newPage());
-    watchPage(activePage);
+  if (!state.activePage || state.activePage.isClosed()) {
+    state.activePage = [...state.pages].filter((page) => !page.isClosed()).at(-1) || null;
   }
-  return activePage;
+  if (!state.activePage) {
+    state.activePage = await browserContext.newPage();
+    watchPage(state.activePage, state);
+  }
+  return state.activePage;
 }
 
-async function pageSummary(page = activePage) {
+async function pageSummary(page = currentClientState().activePage) {
   if (!page || page.isClosed()) return { active: false };
   let title = "";
   try {
@@ -212,15 +320,17 @@ async function pageSummary(page = activePage) {
 }
 
 async function requireRemotePage() {
+  const state = currentClientState();
+  const remoteBrowser = state.remoteBrowser;
   if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil; önce browser_external_discover/connect kullanın.");
-  if (!remoteActivePage || remoteActivePage.isClosed()) {
+  if (!state.remoteActivePage || state.remoteActivePage.isClosed()) {
     const pages = await remoteBrowser.pages();
-    remoteActivePage = pages[0] || (await remoteBrowser.newPage());
+    state.remoteActivePage = pages[0] || (await remoteBrowser.newPage());
   }
-  return remoteActivePage;
+  return state.remoteActivePage;
 }
 
-async function remotePageSummary(page = remoteActivePage) {
+async function remotePageSummary(page = currentClientState().remoteActivePage) {
   if (!page || page.isClosed()) return { active: false };
   let title = "";
   try {
@@ -341,9 +451,11 @@ async function targetPoint(page, input, prefix = "target") {
   const locatorCount = locatorTargetCount(input, prefix);
   const x = input[`${prefix}X`];
   const y = input[`${prefix}Y`];
+  const offsetX = input[`${prefix}OffsetX`];
+  const offsetY = input[`${prefix}OffsetY`];
   const hasLocator = locatorCount > 0;
   const hasPoint = x !== undefined || y !== undefined;
-  if (locatorCount > 1 || hasLocator === hasPoint || (hasPoint && (x === undefined || y === undefined))) {
+  if (locatorCount > 1 || hasLocator === hasPoint || (hasPoint && (x === undefined || y === undefined)) || (hasPoint && (offsetX !== undefined || offsetY !== undefined))) {
     throw new Error(`${prefix} için tek locator veya x+y koordinatı verin.`);
   }
   if (hasPoint) return { x, y };
@@ -354,7 +466,104 @@ async function targetPoint(page, input, prefix = "target") {
   await target.scrollIntoViewIfNeeded();
   const box = await target.boundingBox();
   if (!box) throw new Error(`${prefix} gorunur bir hedef degil.`);
-  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  return {
+    x: box.x + (offsetX ?? box.width / 2),
+    y: box.y + (offsetY ?? box.height / 2),
+  };
+}
+
+async function pacedMouseMove(page, source, target, steps, stepDelayMs) {
+  for (let step = 1; step <= steps; step += 1) {
+    const progress = step / steps;
+    await page.mouse.move(
+      source.x + (target.x - source.x) * progress,
+      source.y + (target.y - source.y) * progress,
+    );
+    if (stepDelayMs > 0 && step < steps) {
+      await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
+    }
+  }
+}
+
+function randomIntBetween(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function humanizedMouseMove(page, target, movementMs) {
+  const previous = mousePositions.get(page);
+  const viewport = page.viewportSize() || DEFAULT_VIEWPORT;
+  const source = previous || { x: viewport.width / 2, y: viewport.height / 2 };
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const distance = Math.hypot(dx, dy);
+  const duration = movementMs ?? randomIntBetween(
+    currentClientState().humanizer.movementMinMs,
+    currentClientState().humanizer.movementMaxMs,
+  );
+  const steps = Math.max(2, Math.min(120, Math.ceil(duration / 16)));
+  const curve = Math.min(36, distance * 0.08) * (Math.random() < 0.5 ? -1 : 1);
+  const normalX = distance ? -dy / distance : 0;
+  const normalY = distance ? dx / distance : 0;
+  for (let step = 1; step <= steps; step += 1) {
+    const t = step / steps;
+    const eased = t * t * (3 - 2 * t);
+    const bend = Math.sin(Math.PI * eased) * curve;
+    const x = source.x + dx * eased + normalX * bend;
+    const y = source.y + dy * eased + normalY * bend;
+    await page.mouse.move(step === steps ? target.x : x, step === steps ? target.y : y);
+    mousePositions.set(page, { x: step === steps ? target.x : x, y: step === steps ? target.y : y });
+    if (step === 1 || step === steps || step % Math.max(1, Math.floor(steps / 3)) === 0) {
+      await showPointer(page, step === steps ? target.x : x, step === steps ? target.y : y, { persistent: true });
+    }
+    if (duration > 0 && step < steps) {
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1, duration / steps)));
+    }
+  }
+}
+
+async function movePointer(page, x, y, { steps = 8, movementMs } = {}) {
+  if (currentClientState().humanizer.enabled) {
+    await humanizedMouseMove(page, { x, y }, movementMs);
+    return;
+  }
+  await page.mouse.move(x, y, { steps });
+  mousePositions.set(page, { x, y });
+}
+
+async function waitHumanizerThink(action = {}) {
+  const settings = currentClientState().humanizer;
+  if (!settings.enabled) return;
+  const delay = action.thinkingDelayMs ?? randomIntBetween(settings.thinkingDelayMinMs, settings.thinkingDelayMaxMs);
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function performMouseDrag(page, source, target, {
+  button = "left",
+  steps = 24,
+  holdMs = 80,
+  targetHoldMs = 120,
+  stepDelayMs = 8,
+  movementMs,
+} = {}) {
+  await movePointer(page, source.x, source.y, { movementMs });
+  await showPointer(page, source.x, source.y);
+  await pressMouseDown(page, button, 1);
+  try {
+    await setPointerPressed(page, true);
+    if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
+    if (currentClientState().humanizer.enabled) {
+      await humanizedMouseMove(page, target, movementMs);
+    } else {
+      await pacedMouseMove(page, source, target, steps, stepDelayMs);
+      mousePositions.set(page, { x: target.x, y: target.y });
+    }
+    await showPointer(page, target.x, target.y, { persistent: true });
+    await setPointerPressed(page, true);
+    if (targetHoldMs > 0) await new Promise((resolve) => setTimeout(resolve, targetHoldMs));
+  } finally {
+    await pressMouseUp(page, button);
+    await setPointerPressed(page, false);
+  }
 }
 
 function visibleElementData(frame) {
@@ -423,6 +632,54 @@ function visibleElementData(frame) {
   });
 }
 
+function blocklyWorkspaceData(frame) {
+  return frame.evaluate(() => {
+    const BlocklyApi = window.Blockly;
+    const workspace = BlocklyApi?.getMainWorkspace?.();
+    if (!workspace) return null;
+    const canvas = workspace.getCanvas?.();
+    const matrix = canvas?.getScreenCTM?.();
+    const toViewport = (x, y) => matrix
+      ? { x: Math.round(matrix.a * x + matrix.c * y + matrix.e), y: Math.round(matrix.b * x + matrix.d * y + matrix.f) }
+      : null;
+    const blocks = workspace.getAllBlocks?.(false) || [];
+    const details = blocks.slice(0, 250).map((block) => {
+      const xy = block.getRelativeToSurfaceXY?.();
+      const element = block.getSvgRoot?.();
+      const rect = element?.getBoundingClientRect?.();
+      const connections = [block.outputConnection, block.previousConnection, block.nextConnection,
+        ...(block.inputList || []).flatMap((input) => [input.connection])]
+        .filter(Boolean)
+        .map((connection) => ({
+          type: connection.type,
+          check: connection.getCheck?.() || null,
+          connected: Boolean(connection.targetConnection),
+          point: toViewport(connection.x, connection.y),
+        }));
+      const fields = (block.inputList || []).flatMap((input) => input.fieldRow || [])
+        .map((field) => ({ name: field.name || null, value: String(field.getValue?.() ?? field.getText?.() ?? "").slice(0, 120) }))
+        .filter((field) => field.value);
+      return {
+        id: block.id,
+        type: block.type,
+        text: (block.toString?.(50) || "").slice(0, 240),
+        xy: xy ? { x: Math.round(xy.x), y: Math.round(xy.y) } : null,
+        bounds: rect ? { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } : null,
+        fields,
+        connections,
+      };
+    });
+    const variables = workspace.getAllVariables?.().map((variable) => ({ id: variable.getId?.(), name: variable.name, type: variable.type || "" })) || [];
+    return {
+      blockCount: blocks.length,
+      returnedBlocks: details.length,
+      truncated: blocks.length > details.length,
+      variables: variables.slice(0, 500),
+      blocks: details,
+    };
+  });
+}
+
 async function clickableElements(page) {
   const viewport = page.viewportSize() || { width: 1280, height: 800 };
   const elements = [];
@@ -460,6 +717,7 @@ async function clickableElements(page) {
 }
 
 async function executeActionOnce(page, action) {
+  await waitHumanizerThink(action);
   switch (action.type) {
     case "click": {
       assertClickTarget(action);
@@ -470,11 +728,11 @@ async function executeActionOnce(page, action) {
         if (!box) throw new Error("Tiklama hedefi gorunur degil.");
         const x = box.x + box.width / 2;
         const y = box.y + box.height / 2;
-        await page.mouse.move(x, y, { steps: action.steps });
+        await movePointer(page, x, y, action);
         await showPointer(page, x, y, { persistent: true });
         await target.click({ button: action.button, clickCount: action.clickCount });
       } else {
-        await page.mouse.move(action.x, action.y, { steps: action.steps });
+        await movePointer(page, action.x, action.y, action);
         await showPointer(page, action.x, action.y, { persistent: true });
         await page.mouse.click(action.x, action.y, { button: action.button, clickCount: action.clickCount });
       }
@@ -482,8 +740,14 @@ async function executeActionOnce(page, action) {
     }
     case "move":
       if (action.x === undefined || action.y === undefined) throw new Error("move icin x+y gerekir.");
-      await page.mouse.move(action.x, action.y, { steps: action.steps });
+      await movePointer(page, action.x, action.y, action);
       await showPointer(page, action.x, action.y, { persistent: true });
+      break;
+    case "drag":
+      if ([action.sourceX, action.sourceY, action.targetX, action.targetY].some((value) => value === undefined)) {
+        throw new Error("drag icin sourceX/sourceY ve targetX/targetY gerekir.");
+      }
+      await performMouseDrag(page, { x: action.sourceX, y: action.sourceY }, { x: action.targetX, y: action.targetY }, action);
       break;
     case "down":
       await pressMouseDown(page, action.button, 1);
@@ -525,48 +789,25 @@ async function executeAction(page, action) {
   if (action.afterMs) await new Promise((resolve) => setTimeout(resolve, action.afterMs));
 }
 
-const enqueueBrowserOperation = createSerialQueue();
-const serializedBrowserTools = new Set([
-  "browser_start",
-  "browser_mouse_move",
-  "browser_mouse_button",
-  "browser_keyboard",
-  "browser_drag",
-  "browser_actions",
-  "browser_new_tab",
-  "browser_switch_tab",
-  "browser_close_tab",
-  "browser_release_inputs",
-  "browser_open",
-  "browser_click",
-  "browser_type",
-  "browser_keypress",
-  "browser_mcp_pointer",
-  "browser_import_cookies",
-  "browser_save_profile",
-  "browser_close",
-  "browser_external_connect",
-  "browser_external_disconnect",
-  "browser_external_switch_tab",
-  "browser_external_new_tab",
-  "browser_external_close_tab",
-  "browser_external_navigate",
-  "browser_external_click",
-  "browser_external_sequence",
-  "browser_external_move",
-  "browser_external_key",
-]);
-
 function registerBrowserTool(server, name, options, handler) {
+  const state = serverClientStates.get(server) || fallbackClientState;
   server.registerTool(name, options, (...args) => {
-    const operation = () => handler(...args);
-    return serializedBrowserTools.has(name) ? enqueueBrowserOperation(operation) : operation();
+    const operation = () => clientStorage.run(state, async () => {
+      if (state.idleTimer) clearTimeout(state.idleTimer);
+      state.idleTimer = null;
+      try {
+        return await handler(...args);
+      } finally {
+        scheduleClientIdleCleanup(state);
+      }
+    });
+    return state.queue(operation);
   });
 }
 
 function registerTools(server) {
   const actionSchema = z.object({
-    type: z.enum(["click", "move", "down", "up", "key_down", "key_up", "press", "type", "wheel", "wait"]),
+    type: z.enum(["click", "move", "drag", "down", "up", "key_down", "key_up", "press", "type", "wheel", "wait"]),
     selector: z.string().min(1).max(2_000).optional(),
     text: z.string().max(100_000).optional(),
     role: z.string().min(1).max(100).optional(),
@@ -577,17 +818,46 @@ function registerTools(server) {
     exact: z.boolean().optional().default(true),
     x: z.number().min(0).max(20_000).optional(),
     y: z.number().min(0).max(20_000).optional(),
+    sourceX: z.number().min(0).max(20_000).optional(),
+    sourceY: z.number().min(0).max(20_000).optional(),
+    targetX: z.number().min(0).max(20_000).optional(),
+    targetY: z.number().min(0).max(20_000).optional(),
     button: z.enum(["left", "right", "middle"]).optional().default("left"),
     clickCount: z.number().int().min(1).max(3).optional().default(1),
     steps: z.number().int().min(1).max(200).optional().default(8),
+    holdMs: z.number().int().min(0).max(2_000).optional().default(80),
+    targetHoldMs: z.number().int().min(0).max(2_000).optional().default(120),
+    stepDelayMs: z.number().int().min(0).max(100).optional().default(8),
+    movementMs: z.number().int().min(0).max(5_000).optional(),
+    thinkingDelayMs: z.number().int().min(0).max(10_000).optional(),
     key: z.string().min(1).max(100).optional(),
     deltaX: z.number().min(-100_000).max(100_000).optional().default(0),
     deltaY: z.number().min(-100_000).max(100_000).optional().default(0),
     ms: z.number().int().min(0).max(30_000).optional().default(0),
     delayMs: z.number().int().min(0).max(500).optional().default(0),
     repeat: z.number().int().min(1).max(100).optional().default(1),
-    intervalMs: z.number().int().min(0).max(2_000).optional().default(40),
-    afterMs: z.number().int().min(0).max(2_000).optional().default(20),
+    intervalMs: z.number().int().min(0).max(2_000).optional().default(0),
+    afterMs: z.number().int().min(0).max(2_000).optional().default(0),
+  });
+
+  registerBrowserTool(server, "browser_humanizer", {
+    title: "Configure mouse movement profile",
+    description: "Gets or updates this MCP agent's optional natural cursor movement and thinking-pause profile. Disabled by default; settings are isolated per agent and do not affect other clients.",
+    inputSchema: {
+      enabled: z.boolean().optional(),
+      movementMinMs: z.number().int().min(0).max(5_000).optional(),
+      movementMaxMs: z.number().int().min(0).max(5_000).optional(),
+      thinkingDelayMinMs: z.number().int().min(0).max(10_000).optional(),
+      thinkingDelayMaxMs: z.number().int().min(0).max(10_000).optional(),
+    },
+  }, async (input) => {
+    const settings = currentClientState().humanizer;
+    const next = { ...settings, ...Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) };
+    if (next.movementMinMs > next.movementMaxMs || next.thinkingDelayMinMs > next.thinkingDelayMaxMs) {
+      throw new Error("Minimum delay cannot exceed its maximum; the previous profile was restored.");
+    }
+    Object.assign(settings, next);
+    return ok(JSON.stringify({ ...settings, scope: "this MCP client only" }, null, 2));
   });
 
   registerBrowserTool(server,
@@ -630,6 +900,30 @@ function registerTools(server) {
     },
   );
 
+  registerBrowserTool(server, "browser_blockly_inspect", {
+    title: "Inspect Blockly workspace",
+    description: "Reports visible Blockly block bounds, field values, exact connection/drop-point viewport coordinates, and workspace variable names/IDs. Use connection points with browser_drag instead of dropping onto neighboring block bodies; for variable reporters, select the exact variable name/ID first.",
+    inputSchema: {},
+  }, async () => {
+    try {
+      const page = await requirePage();
+      const workspaces = [];
+      for (const [frameIndex, frame] of page.frames().entries()) {
+        if (frame.isDetached()) continue;
+        try {
+          const data = await blocklyWorkspaceData(frame);
+          if (data) workspaces.push({ frameIndex, frameUrl: frame.url(), ...data });
+        } catch {
+          // Blockly can replace its workspace while an editor is loading.
+        }
+      }
+      if (!workspaces.length) return fail("No accessible Blockly workspace was found; Blockly may be embedded in a cross-origin frame or use a private runtime.");
+      return ok(JSON.stringify({ workspaces, ...(await pageSummary(page)) }, null, 2));
+    } catch (error) {
+      return fail(`Blockly inspection failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  });
+
   registerBrowserTool(server,
     "browser_observe",
     {
@@ -663,12 +957,15 @@ function registerTools(server) {
         x: z.number().min(0).max(20_000),
         y: z.number().min(0).max(20_000),
         steps: z.number().int().min(1).max(300).optional().default(12),
+        movementMs: z.number().int().min(0).max(5_000).optional(),
+        thinkingDelayMs: z.number().int().min(0).max(10_000).optional(),
       },
     },
-    async ({ x, y, steps }) => {
+    async ({ x, y, steps, movementMs, thinkingDelayMs }) => {
       try {
         const page = await requirePage();
-        await page.mouse.move(x, y, { steps });
+        await waitHumanizerThink({ thinkingDelayMs });
+        await movePointer(page, x, y, { steps, movementMs });
         await showPointer(page, x, y, { persistent: true });
         return ok(JSON.stringify({ action: "move", x, y, steps, ...(await pageSummary(page)) }, null, 2));
       } catch (error) {
@@ -689,15 +986,18 @@ function registerTools(server) {
         y: z.number().min(0).max(20_000).optional(),
         clickCount: z.number().int().min(1).max(3).optional().default(1),
         steps: z.number().int().min(1).max(300).optional().default(8),
+        movementMs: z.number().int().min(0).max(5_000).optional(),
+        thinkingDelayMs: z.number().int().min(0).max(10_000).optional(),
       },
     },
-    async ({ action, button, x, y, clickCount, steps }) => {
+    async ({ action, button, x, y, clickCount, steps, movementMs, thinkingDelayMs }) => {
       try {
         if ((x === undefined) !== (y === undefined)) throw new Error("x ve y birlikte verilmelidir.");
         if (action === "click" && (x === undefined || y === undefined)) throw new Error("click için x ve y gereklidir.");
         const page = await requirePage();
+        if (action === "click") await waitHumanizerThink({ thinkingDelayMs });
         if (x !== undefined && y !== undefined) {
-          await page.mouse.move(x, y, { steps });
+          await movePointer(page, x, y, { steps, movementMs });
           await showPointer(page, x, y, { persistent: true });
         }
         if (action === "down") await pressMouseDown(page, button, clickCount);
@@ -746,7 +1046,7 @@ function registerTools(server) {
     "browser_drag",
     {
       title: "Drag and drop",
-      description: "Performs a real mouse drag between selectors/text targets or viewport coordinates, with visible pointer movement.",
+      description: "Drag-and-drop between selectors/text targets or exact viewport coordinates. For Blockly use browser_blockly_inspect then drop on the reported connection point; for Scratch/canvas use observed coordinates. Supports paced or optional humanized mouse movement and configurable hold times. Locator offsets are pixels from the target's top-left corner.",
       inputSchema: {
         sourceSelector: z.string().min(1).max(2_000).optional(),
         sourceText: z.string().min(1).max(500).optional(),
@@ -757,6 +1057,8 @@ function registerTools(server) {
         sourceTestId: z.string().min(1).max(500).optional(),
         sourceX: z.number().min(0).max(20_000).optional(),
         sourceY: z.number().min(0).max(20_000).optional(),
+        sourceOffsetX: z.number().min(-20_000).max(20_000).optional(),
+        sourceOffsetY: z.number().min(-20_000).max(20_000).optional(),
         targetSelector: z.string().min(1).max(2_000).optional(),
         targetText: z.string().min(1).max(500).optional(),
         targetRole: z.string().min(1).max(100).optional(),
@@ -766,10 +1068,16 @@ function registerTools(server) {
         targetTestId: z.string().min(1).max(500).optional(),
         targetX: z.number().min(0).max(20_000).optional(),
         targetY: z.number().min(0).max(20_000).optional(),
+        targetOffsetX: z.number().min(-20_000).max(20_000).optional(),
+        targetOffsetY: z.number().min(-20_000).max(20_000).optional(),
+        movementMs: z.number().int().min(0).max(5_000).optional(),
+        thinkingDelayMs: z.number().int().min(0).max(10_000).optional(),
         exact: z.boolean().optional().default(true),
         button: z.enum(["left", "right", "middle"]).optional().default("left"),
         steps: z.number().int().min(1).max(300).optional().default(24),
         holdMs: z.number().int().min(0).max(2_000).optional().default(80),
+        targetHoldMs: z.number().int().min(0).max(2_000).optional().default(120),
+        stepDelayMs: z.number().int().min(0).max(100).optional().default(8),
       },
     },
     async (input) => {
@@ -777,19 +1085,8 @@ function registerTools(server) {
         const page = await requirePage();
         const source = await targetPoint(page, input, "source");
         const target = await targetPoint(page, input, "target");
-        await page.mouse.move(source.x, source.y, { steps: input.steps });
-        await showPointer(page, source.x, source.y);
-        await pressMouseDown(page, input.button, 1);
-        await setPointerPressed(page, true);
-        try {
-          if (input.holdMs) await new Promise((resolve) => setTimeout(resolve, input.holdMs));
-          await page.mouse.move(target.x, target.y, { steps: input.steps });
-          await showPointer(page, target.x, target.y, { persistent: true });
-          await setPointerPressed(page, true);
-        } finally {
-          await pressMouseUp(page, input.button);
-          await setPointerPressed(page, false);
-        }
+        await waitHumanizerThink(input);
+        await performMouseDrag(page, source, target, input);
         return ok(JSON.stringify({ source, target, ...(await pageSummary(page)) }, null, 2));
       } catch (error) {
         return fail(`Drag failed: ${error instanceof Error ? error.message : "unknown error"}`);
@@ -802,7 +1099,7 @@ function registerTools(server) {
     {
       title: "Run browser action sequence",
       description:
-        "Runs an exclusive sequence of up to 200 mouse, key press/down/up, typing, wheel and wait actions. Use repeat (up to 100) and intervalMs for repeated clicks/keys/text; use afterMs between different steps when a game/page needs time to respond.",
+        "Runs up to 200 actions in one MCP call to avoid slow agent round trips. Supports precise coordinate drag (sourceX/sourceY to targetX/targetY), click, move, held mouse/keys, typing, wheel and wait. For Blockly use browser_blockly_inspect and drop at a reported connection point. For Scratch/canvas, use drag with steps 24-40 and inspect before/after. Optional per-action movementMs/thinkingDelayMs or the per-agent browser_humanizer profile add pacing; otherwise timings remain unchanged.",
       inputSchema: { actions: z.array(actionSchema).min(1).max(200) },
     },
     async ({ actions }) => {
@@ -866,6 +1163,24 @@ function registerTools(server) {
     async () => ok(JSON.stringify(await pageSummary(), null, 2)),
   );
 
+  registerBrowserTool(server, "browser_session_status", {
+    title: "Agent browser session status",
+    description: "Shows the MCP client slot, connected agent count, and this agent's managed tabs.",
+    inputSchema: {},
+  }, async () => {
+    const state = currentClientState();
+    return ok(JSON.stringify({
+      slot: state.slot ?? "stdio",
+      connectedAgents: Math.max(0, clientStates.size - 1),
+      maxAgents: MAX_MCP_CLIENTS,
+      tabs: [...state.pages].filter((page) => !page.isClosed()).length,
+      maxTabs: MAX_TABS_PER_CLIENT,
+      idleTabTimeoutMs: Number.isFinite(IDLE_TAB_TIMEOUT_MS) && IDLE_TAB_TIMEOUT_MS > 0 ? IDLE_TAB_TIMEOUT_MS : null,
+      sharedBrowserProcess: true,
+      humanizer: { ...state.humanizer },
+    }, null, 2));
+  });
+
   registerBrowserTool(server,
     "browser_tabs",
     {
@@ -876,10 +1191,12 @@ function registerTools(server) {
     async () => {
       try {
         if (!context) return ok(JSON.stringify({ active: false, tabs: [] }, null, 2));
-        const tabs = await Promise.all(context.pages().map(async (page, index) => ({
+        const state = currentClientState();
+        const pages = [...state.pages].filter((page) => !page.isClosed());
+        const tabs = await Promise.all(pages.map(async (page, index) => ({
           index,
           ...(await pageSummary(page)),
-          active: page === activePage,
+          active: page === state.activePage,
         })));
         return ok(JSON.stringify({ active: true, tabs }, null, 2));
       } catch (error) {
@@ -899,8 +1216,13 @@ function registerTools(server) {
       try {
         const targetUrl = url ? validateHttpUrl(url) : undefined;
         const browserContext = await ensureBrowser();
+        const state = currentClientState();
+        if ([...state.pages].filter((item) => !item.isClosed()).length >= MAX_TABS_PER_CLIENT) {
+          throw new Error(`Each agent is limited to ${MAX_TABS_PER_CLIENT} tabs to keep resource use bounded.`);
+        }
         const page = await browserContext.newPage();
-        activePage = page;
+        watchPage(page);
+        currentClientState().activePage = page;
         if (targetUrl) await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
         return ok(JSON.stringify(await pageSummary(page), null, 2));
       } catch (error) {
@@ -918,10 +1240,10 @@ function registerTools(server) {
     },
     async ({ index }) => {
       try {
-        const browserContext = await ensureBrowser();
-        const page = browserContext.pages()[index];
+        const state = currentClientState();
+        const page = [...state.pages].filter((item) => !item.isClosed())[index];
         if (!page || page.isClosed()) throw new Error(`Tab index ${index} does not exist.`);
-        activePage = page;
+        state.activePage = page;
         await page.bringToFront();
         return ok(JSON.stringify({ index, ...(await pageSummary(page)) }, null, 2));
       } catch (error) {
@@ -939,14 +1261,14 @@ function registerTools(server) {
     },
     async ({ index }) => {
       try {
-        const browserContext = await ensureBrowser();
-        const page = browserContext.pages()[index];
+        const state = currentClientState();
+        const page = [...state.pages].filter((item) => !item.isClosed())[index];
         if (!page || page.isClosed()) throw new Error(`Tab index ${index} does not exist.`);
         await page.close();
-        const pages = browserContext.pages();
-        activePage = pages.at(-1) || null;
-        if (activePage) await activePage.bringToFront();
-        return ok(JSON.stringify({ closedIndex: index, tabsRemaining: pages.length, ...(await pageSummary(activePage)) }, null, 2));
+        const pages = [...state.pages].filter((item) => !item.isClosed());
+        state.activePage = pages.at(-1) || null;
+        if (state.activePage) await state.activePage.bringToFront();
+        return ok(JSON.stringify({ closedIndex: index, tabsRemaining: pages.length, ...(await pageSummary(state.activePage)) }, null, 2));
       } catch (error) {
         return fail(`Tab close failed: ${error instanceof Error ? error.message : "unknown error"}`);
       }
@@ -962,13 +1284,13 @@ function registerTools(server) {
     },
     async () => {
       try {
-        if (!context || !activePage || activePage.isClosed()) return ok(JSON.stringify({ released: { keys: [], buttons: [] }, errors: [] }));
-        const results = await Promise.all(context.pages().map(async (page) => ({
+        if (!context || !currentClientState().activePage || currentClientState().activePage.isClosed()) return ok(JSON.stringify({ released: { keys: [], buttons: [] }, errors: [] }));
+        const results = await Promise.all([...currentClientState().pages].filter((page) => !page.isClosed()).map(async (page) => ({
           url: page.url(),
           ...(await releaseInputs(page)),
         })));
-        await setPointerPressed(activePage, false);
-        return ok(JSON.stringify({ tabs: results, ...(await pageSummary(activePage)) }, null, 2));
+        await setPointerPressed(currentClientState().activePage, false);
+        return ok(JSON.stringify({ tabs: results, ...(await pageSummary(currentClientState().activePage)) }, null, 2));
       } catch (error) {
         return fail(`Input release failed: ${error instanceof Error ? error.message : "unknown error"}`);
       }
@@ -1054,12 +1376,15 @@ function registerTools(server) {
         y: z.number().int().min(0).max(20_000).optional(),
         button: z.enum(["left", "right", "middle"]).optional().default("left"),
         clickCount: z.number().int().min(1).max(3).optional().default(1),
+        movementMs: z.number().int().min(0).max(5_000).optional(),
+        thinkingDelayMs: z.number().int().min(0).max(10_000).optional(),
       },
     },
     async (input) => {
       try {
         assertClickTarget(input);
         const page = await requirePage();
+        await waitHumanizerThink(input);
         const target = getTarget(page, input);
         if (target) {
           await target.scrollIntoViewIfNeeded();
@@ -1067,12 +1392,12 @@ function registerTools(server) {
           if (box) {
             const x = box.x + box.width / 2;
             const y = box.y + box.height / 2;
-            await page.mouse.move(x, y, { steps: 8 });
+            await movePointer(page, x, y, input);
             await showPointer(page, x, y);
           }
           await target.click({ button: input.button, clickCount: input.clickCount });
         } else {
-          await page.mouse.move(input.x, input.y, { steps: 8 });
+          await movePointer(page, input.x, input.y, input);
           await showPointer(page, input.x, input.y);
           await page.mouse.click(input.x, input.y, { button: input.button, clickCount: input.clickCount });
         }
@@ -1258,14 +1583,15 @@ function registerTools(server) {
   registerBrowserTool(server,
     "browser_close",
     {
-      title: "Tarayıcıyı kapat",
-      description: "Tarayıcıyı kapatır; kalıcı profil ve hesap oturumları yerinde kalır.",
+      title: "Close this agent's browser tabs",
+      description: "Closes only this MCP client's tabs. Other agents and the shared browser remain active; the persistent profile is preserved.",
     },
     async () => {
-      if (!context) return ok("Tarayıcı zaten kapalı.");
-      const closing = context;
-      await closing.close();
-      return ok("Tarayıcı kapatıldı; profil korunuyor.");
+      const state = currentClientState();
+      const pages = [...state.pages];
+      for (const page of pages) await page.close().catch(() => {});
+      state.activePage = null;
+      return ok(`Closed ${pages.length} tab(s); shared browser and profile remain open.`);
     },
   );
 }
@@ -1285,7 +1611,7 @@ function registerExternalBrowserTools(server) {
     deltaY: z.number().min(-100_000).max(100_000).optional().default(0),
     ms: z.number().int().min(0).max(30_000).optional().default(0),
     repeat: z.number().int().min(1).max(100).optional().default(1),
-    intervalMs: z.number().int().min(0).max(2_000).optional().default(40),
+    intervalMs: z.number().int().min(0).max(2_000).optional().default(0),
   });
 
   registerBrowserTool(server, "browser_external_discover", {
@@ -1308,19 +1634,19 @@ function registerExternalBrowserTools(server) {
       connection = await puppeteer.connect({ browserWSEndpoint: target.endpoint, protocol: target.protocol, defaultViewport: null });
       const pages = await connection.pages();
       if (!pages.length) throw new Error("Tarayıcı bağlandı ancak açık sekme bulunamadı.");
-      if (remoteBrowser) await remoteBrowser.disconnect();
-      remoteBrowser = connection;
-      remoteBrowserInfo = { protocol, port, browser: protocol === "webDriverBiDi" ? "Firefox" : "Chromium tabanlı" };
+      if (currentClientState().remoteBrowser) await currentClientState().remoteBrowser.disconnect();
+      currentClientState().remoteBrowser = connection;
+      currentClientState().remoteBrowserInfo = { protocol, port, browser: protocol === "webDriverBiDi" ? "Firefox" : "Chromium tabanlı" };
       const discovered = await discoverRemoteBrowsers();
       const detectedBrowser = discovered.find((item) => item.port === port && item.protocol === protocol)?.browser;
-      if (detectedBrowser) remoteBrowserInfo.browser = detectedBrowser;
-      remoteActivePage = pages[0];
+      if (detectedBrowser) currentClientState().remoteBrowserInfo.browser = detectedBrowser;
+      currentClientState().remoteActivePage = pages[0];
       for (const page of pages) page.on("close", () => {
-        if (remoteActivePage === page) remoteActivePage = null;
+        if (currentClientState().remoteActivePage === page) currentClientState().remoteActivePage = null;
       });
-      return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: pages.length, ...(await remotePageSummary(remoteActivePage)) }, null, 2));
+      return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: pages.length, ...(await remotePageSummary(currentClientState().remoteActivePage)) }, null, 2));
     } catch (error) {
-      if (connection && connection !== remoteBrowser) await connection.disconnect().catch(() => {});
+      if (connection && connection !== currentClientState().remoteBrowser) await connection.disconnect().catch(() => {});
       return fail(`External browser attach failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   });
@@ -1330,8 +1656,8 @@ function registerExternalBrowserTools(server) {
     description: "Bağlı harici tarayıcıyı ve etkin sekmeyi gösterir; cookie veya profil dosyalarını okumaz.",
     inputSchema: {},
   }, async () => {
-    if (!remoteBrowser) return ok(JSON.stringify({ connected: false }));
-    try { return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: (await remoteBrowser.pages()).length, ...(await remotePageSummary()) }, null, 2)); }
+    if (!currentClientState().remoteBrowser) return ok(JSON.stringify({ connected: false }));
+    try { return ok(JSON.stringify({ connected: true, ...remoteBrowserInfo, tabs: (await currentClientState().remoteBrowser.pages()).length, ...(await remotePageSummary()) }, null, 2)); }
     catch (error) { return fail(`External browser status failed: ${error instanceof Error ? error.message : "unknown error"}`); }
   });
 
@@ -1341,9 +1667,9 @@ function registerExternalBrowserTools(server) {
     inputSchema: {},
   }, async () => {
     try {
-      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
-      const pages = await remoteBrowser.pages();
-      return ok(JSON.stringify(await Promise.all(pages.map(async (page, index) => ({ index, active: page === remoteActivePage, ...(await remotePageSummary(page)) }))), null, 2));
+      if (!currentClientState().remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const pages = await currentClientState().remoteBrowser.pages();
+      return ok(JSON.stringify(await Promise.all(pages.map(async (page, index) => ({ index, active: page === currentClientState().remoteActivePage, ...(await remotePageSummary(page)) }))), null, 2));
     } catch (error) { return fail(`External tabs failed: ${error instanceof Error ? error.message : "unknown error"}`); }
   });
 
@@ -1353,10 +1679,10 @@ function registerExternalBrowserTools(server) {
     inputSchema: { index: z.number().int().min(0).max(200) },
   }, async ({ index }) => {
     try {
-      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
-      const page = (await remoteBrowser.pages())[index];
+      if (!currentClientState().remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const page = (await currentClientState().remoteBrowser.pages())[index];
       if (!page || page.isClosed()) throw new Error(`Sekme indeksi ${index} bulunamadı.`);
-      remoteActivePage = page;
+      currentClientState().remoteActivePage = page;
       await page.bringToFront();
       return ok(JSON.stringify({ index, ...(await remotePageSummary(page)) }, null, 2));
     } catch (error) { return fail(`External tab switch failed: ${error instanceof Error ? error.message : "unknown error"}`); }
@@ -1368,9 +1694,9 @@ function registerExternalBrowserTools(server) {
     inputSchema: { url: z.string().max(2_048).optional() },
   }, async ({ url }) => {
     try {
-      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
-      const page = await remoteBrowser.newPage();
-      remoteActivePage = page;
+      if (!currentClientState().remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const page = await currentClientState().remoteBrowser.newPage();
+      currentClientState().remoteActivePage = page;
       if (url) await page.goto(validateHttpUrl(url));
       await page.bringToFront();
       return ok(JSON.stringify(await remotePageSummary(page), null, 2));
@@ -1383,14 +1709,14 @@ function registerExternalBrowserTools(server) {
     inputSchema: { index: z.number().int().min(0).max(200) },
   }, async ({ index }) => {
     try {
-      if (!remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
-      const pages = await remoteBrowser.pages();
+      if (!currentClientState().remoteBrowser) throw new Error("Harici tarayıcı bağlı değil.");
+      const pages = await currentClientState().remoteBrowser.pages();
       const page = pages[index];
       if (!page || page.isClosed()) throw new Error(`Sekme indeksi ${index} bulunamadı.`);
       await page.close();
-      const remaining = await remoteBrowser.pages();
-      remoteActivePage = remaining.at(-1) || null;
-      if (remoteActivePage) await remoteActivePage.bringToFront();
+      const remaining = await currentClientState().remoteBrowser.pages();
+      currentClientState().remoteActivePage = remaining.at(-1) || null;
+      if (currentClientState().remoteActivePage) await currentClientState().remoteActivePage.bringToFront();
       return ok(JSON.stringify({ closedIndex: index, tabsRemaining: remaining.length, ...(await remotePageSummary()) }, null, 2));
     } catch (error) { return fail(`External tab close failed: ${error instanceof Error ? error.message : "unknown error"}`); }
   });
@@ -1539,17 +1865,17 @@ function registerExternalBrowserTools(server) {
     description: "MCP bağlantısını ayırır; gerçek tarayıcıyı, sekmeleri ve profili kapatmaz.",
     inputSchema: {},
   }, async () => {
-    if (!remoteBrowser) return ok("Harici tarayıcı bağlı değil.");
-    const detached = remoteBrowser;
-    remoteBrowser = null;
-    remoteBrowserInfo = null;
-    remoteActivePage = null;
+    if (!currentClientState().remoteBrowser) return ok("Harici tarayıcı bağlı değil.");
+    const detached = currentClientState().remoteBrowser;
+    currentClientState().remoteBrowser = null;
+    currentClientState().remoteBrowserInfo = null;
+    currentClientState().remoteActivePage = null;
     await detached.disconnect();
     return ok("Harici tarayıcıdan ayrıldı; tarayıcı ve sekmeler açık kaldı.");
   });
 }
 
-function createMcpServer() {
+function createMcpServer(clientState = fallbackClientState) {
   const server = new McpServer(
     {
       name: APP_NAME,
@@ -1560,6 +1886,7 @@ function createMcpServer() {
         "Bu sunucu kendi yerel profilini ve kullanıcının açıkça --remote-debugging-port ile erişime açtığı mevcut yerel tarayıcıları kontrol edebilir. Harici tarayıcı için browser_external_discover ve browser_external_connect kullanın; sekmeleri browser_external_tabs/browser_external_switch_tab ile yönetin, browser_external_disconnect ile yalnızca bağlantıyı ayırın. MCP kapanışı harici tarayıcıyı kapatmaz. Debug endpoint'leri yalnızca loopback üzerinden kabul edilir. Cookie değerlerini istemeyin veya döndürmeyin; yan etkili işlemleri kullanıcı amacıyla sınırlayın.",
     },
   );
+  serverClientStates.set(server, clientState);
   registerTools(server);
   registerExternalBrowserTools(server);
   return server;
@@ -1646,6 +1973,9 @@ async function startHttp() {
         pid: process.pid,
         browserActive: Boolean(context),
         page: await pageSummary(),
+        connectedAgents: Math.max(0, clientStates.size - 1),
+        maxAgents: MAX_MCP_CLIENTS,
+        openAgentTabs: [...clientStates.values()].reduce((sum, state) => sum + [...state.pages].filter((page) => !page.isClosed()).length, 0),
         profileDir: PROFILE_DIR,
       });
       return;
@@ -1662,9 +1992,17 @@ async function startHttp() {
         const body = await readJsonBody(request);
         let transport = sessionId ? transports.get(sessionId) : undefined;
         if (!transport && !sessionId && isInitializeRequest(body)) {
+          if (clientStates.size - 1 >= MAX_MCP_CLIENTS) {
+            sendJson(response, 429, { error: `Maximum ${MAX_MCP_CLIENTS} MCP clients are already connected.` });
+            return;
+          }
+          const clientId = randomUUID();
+          const clientState = createClientState(clientId);
+          clientState.slot = availableClientSlot();
+          clientStates.set(clientId, clientState);
           let server;
           transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
+            sessionIdGenerator: () => clientId,
             enableJsonResponse: true,
             onsessioninitialized: (newSessionId) => {
               transports.set(newSessionId, { transport, server });
@@ -1672,12 +2010,25 @@ async function startHttp() {
             onsessionclosed: async (closedSessionId) => {
               const session = transports.get(closedSessionId);
               transports.delete(closedSessionId);
+              const closedState = clientStates.get(closedSessionId);
+              clientStates.delete(closedSessionId);
+              if (closedState) {
+                if (closedState.idleTimer) clearTimeout(closedState.idleTimer);
+                for (const page of closedState.pages) await page.close().catch(() => {});
+                if (closedState.remoteBrowser) await closedState.remoteBrowser.disconnect().catch(() => {});
+              }
               if (session?.server) await session.server.close();
             },
           });
-          server = createMcpServer();
+          server = createMcpServer(clientState);
           await server.connect(transport);
-          await transport.handleRequest(request, response, body);
+          try {
+            await transport.handleRequest(request, response, body);
+          } catch (error) {
+            clientStates.delete(clientId);
+            await server.close().catch(() => {});
+            throw error;
+          }
           return;
         }
         if (!transport) {
@@ -1733,15 +2084,20 @@ async function startHttp() {
 }
 
 async function closeBrowser() {
-  const external = remoteBrowser;
-  remoteBrowser = null;
-  remoteBrowserInfo = null;
-  remoteActivePage = null;
-  if (external) await external.disconnect().catch(() => {});
+  for (const state of clientStates.values()) {
+    if (state.idleTimer) clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+    const external = state.remoteBrowser;
+    state.remoteBrowser = null;
+    state.remoteBrowserInfo = null;
+    state.remoteActivePage = null;
+    if (external) await external.disconnect().catch(() => {});
+    state.activePage = null;
+    state.pages.clear();
+  }
   if (!context) return;
   const closing = context;
   context = null;
-  activePage = null;
   await closing.close().catch(() => {});
 }
 
